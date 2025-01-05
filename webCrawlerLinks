@@ -1,0 +1,287 @@
+from typing import List, Dict, Optional
+import logging
+from urllib.parse import urljoin, urlparse
+import requests
+from bs4 import BeautifulSoup
+import re
+
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.chains import LLMChain
+from langchain.schema import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import SequentialChain
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class WebCrawlerChain:
+    """LangChain-based web crawler and link analyzer."""
+    
+    def __init__(self, openai_api_key: str):
+        self.llm = ChatOpenAI(
+            temperature=0,
+            model_name="gpt-3.5-turbo",
+            openai_api_key=openai_api_key
+        )
+        
+        # Initialize text splitter
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=2000,
+            chunk_overlap=200,
+            length_function=len
+        )
+        
+        # Initialize chains
+        self.link_analyzer_chain = self._create_link_analyzer_chain()
+        self.content_analyzer_chain = self._create_content_analyzer_chain()
+        
+    def _create_link_analyzer_chain(self) -> LLMChain:
+        """Create chain for analyzing links."""
+        prompt = ChatPromptTemplate.from_template("""
+        Analyze the following list of URLs and their anchor texts from a webpage.
+        Categorize them and identify their likely purpose or content type.
+        
+        URLs and Anchor Texts:
+        {links}
+        
+        Provide analysis in the following format:
+        1. Main navigation links
+        2. Content links
+        3. External references
+        4. Resource links
+        5. Potentially relevant links for crawling
+        
+        Analysis:
+        """)
+        
+        return LLMChain(
+            llm=self.llm,
+            prompt=prompt,
+            output_key="link_analysis"
+        )
+    
+    def _create_content_analyzer_chain(self) -> LLMChain:
+        """Create chain for analyzing page content."""
+        prompt = ChatPromptTemplate.from_template("""
+        Analyze the following webpage content and its links.
+        Provide insights about the content structure and link relevance.
+        
+        Page Title: {title}
+        Page URL: {url}
+        Content Preview: {content_preview}
+        Number of Links: {link_count}
+        
+        Provide analysis in the following format:
+        1. Content Type
+        2. Main Topics
+        3. Link Distribution
+        4. Crawling Priority (High/Medium/Low)
+        
+        Analysis:
+        """)
+        
+        return LLMChain(
+            llm=self.llm,
+            prompt=prompt,
+            output_key="content_analysis"
+        )
+
+    def _extract_links(self, url: str, html_content: str) -> List[Dict]:
+        """Extract links and their context from HTML content."""
+        soup = BeautifulSoup(html_content, 'html.parser')
+        base_url = url
+        links = []
+        
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            
+            # Skip empty or javascript links
+            if not href or href.startswith(('javascript:', '#')):
+                continue
+            
+            # Convert relative URLs to absolute
+            absolute_url = urljoin(base_url, href)
+            
+            # Get link context
+            link_text = link.get_text(strip=True)
+            parent_text = ' '.join(p.get_text(strip=True) for p in link.parents 
+                                 if p.name in ['p', 'div', 'section'])[:200]
+            
+            links.append({
+                'url': absolute_url,
+                'text': link_text,
+                'context': parent_text,
+                'is_internal': urlparse(absolute_url).netloc == urlparse(base_url).netloc
+            })
+        
+        return links
+
+    def _clean_text(self, text: str) -> str:
+        """Clean and normalize text content."""
+        # Remove extra whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        # Remove special characters
+        text = re.sub(r'[^\w\s.,-]', '', text)
+        return text
+
+    def crawl_page(self, url: str, depth: int = 0, max_depth: int = 2) -> Dict:
+        """Crawl a webpage and analyze its content and links."""
+        try:
+            # Fetch page content
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            html_content = response.text
+            
+            # Parse HTML
+            soup = BeautifulSoup(html_content, 'html.parser')
+            title = soup.title.string if soup.title else "No title"
+            
+            # Extract main content and clean it
+            main_content = ' '.join(p.get_text() for p in soup.find_all(['p', 'article', 'section']))
+            cleaned_content = self._clean_text(main_content)
+            
+            # Extract links
+            links = self._extract_links(url, html_content)
+            
+            # Analyze links
+            links_text = "\n".join([
+                f"URL: {link['url']}\nText: {link['text']}\nContext: {link['context']}\n"
+                for link in links
+            ])
+            
+            link_analysis = self.link_analyzer_chain.run(links=links_text)
+            
+            # Analyze content
+            content_analysis = self.content_analyzer_chain.run(
+                title=title,
+                url=url,
+                content_preview=cleaned_content[:500],
+                link_count=len(links)
+            )
+            
+            # Prepare results
+            results = {
+                "url": url,
+                "title": title,
+                "depth": depth,
+                "link_count": len(links),
+                "links": links,
+                "link_analysis": link_analysis,
+                "content_analysis": content_analysis,
+                "sub_pages": []
+            }
+            
+            # Recursively crawl internal links if within depth limit
+            if depth < max_depth:
+                for link in [l for l in links if l['is_internal']][:3]:  # Limit to 3 internal links
+                    try:
+                        sub_result = self.crawl_page(link['url'], depth + 1, max_depth)
+                        results["sub_pages"].append(sub_result)
+                    except Exception as e:
+                        logger.error(f"Error crawling {link['url']}: {str(e)}")
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error crawling {url}: {str(e)}")
+            return {
+                "url": url,
+                "error": str(e)
+            }
+
+    def analyze_results(self, results: Dict) -> Dict:
+        """Analyze crawling results and provide insights."""
+        try:
+            # Prepare analysis prompt
+            analysis_prompt = ChatPromptTemplate.from_template("""
+            Analyze the following web crawling results and provide insights:
+            
+            Root URL: {root_url}
+            Total Pages Crawled: {total_pages}
+            Total Links Found: {total_links}
+            
+            Link Analysis:
+            {link_analysis}
+            
+            Content Analysis:
+            {content_analysis}
+            
+            Provide insights in the following format:
+            1. Site Structure
+            2. Content Distribution
+            3. Link Patterns
+            4. Crawling Recommendations
+            
+            Analysis:
+            """)
+            
+            analysis_chain = LLMChain(
+                llm=self.llm,
+                prompt=analysis_prompt,
+                output_key="site_analysis"
+            )
+            
+            # Count total pages and links
+            def count_pages_and_links(result):
+                pages = 1
+                links = len(result.get("links", []))
+                for sub_page in result.get("sub_pages", []):
+                    sub_pages, sub_links = count_pages_and_links(sub_page)
+                    pages += sub_pages
+                    links += sub_links
+                return pages, links
+            
+            total_pages, total_links = count_pages_and_links(results)
+            
+            # Get analysis
+            analysis = analysis_chain.run(
+                root_url=results["url"],
+                total_pages=total_pages,
+                total_links=total_links,
+                link_analysis=results["link_analysis"],
+                content_analysis=results["content_analysis"]
+            )
+            
+            return {
+                "summary": {
+                    "total_pages": total_pages,
+                    "total_links": total_links,
+                    "root_url": results["url"]
+                },
+                "analysis": analysis
+            }
+            
+        except Exception as e:
+            logger.error(f"Error analyzing results: {str(e)}")
+            return {
+                "error": str(e)
+            }
+
+# Example usage
+if __name__ == "__main__":
+    import os
+    from pprint import pprint
+    
+    # Initialize crawler
+    crawler = WebCrawlerChain(
+        openai_api_key=os.getenv("OPENAI_API_KEY")
+    )
+    
+    # Example URL to crawl
+    url = "https://example.com"
+    
+    # Crawl website
+    print(f"Crawling {url}...")
+    results = crawler.crawl_page(url, max_depth=1)
+    
+    # Analyze results
+    print("\nAnalyzing results...")
+    analysis = crawler.analyze_results(results)
+    
+    # Print findings
+    print("\nCrawling Summary:")
+    pprint(analysis["summary"])
+    print("\nAnalysis:")
+    print(analysis["analysis"])
