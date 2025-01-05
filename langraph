@@ -1,0 +1,324 @@
+from typing import Dict, List, Tuple, TypedDict, Annotated, Literal
+from datetime import datetime
+import json
+import logging
+from enum import Enum
+
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.chat_models import ChatOpenAI
+from langchain_core.output_parsers import JsonOutputParser
+from langgraph.graph import Graph, END
+from langgraph.prebuilt import ToolExecutor
+from langgraph.checkpoint import checkpoint
+import operator
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Define state types and enums
+class TaskStatus(str, Enum):
+    PLANNING = "planning"
+    EXECUTING = "executing"
+    REVIEWING = "reviewing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+class TaskType(str, Enum):
+    RESEARCH = "research"
+    ANALYSIS = "analysis"
+    DECISION = "decision"
+    ACTION = "action"
+
+class TaskPriority(str, Enum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+class WorkflowState(TypedDict):
+    """Represents the current state of the workflow."""
+    task_queue: List[Dict]
+    current_task: Dict
+    completed_tasks: List[Dict]
+    context: Dict
+    messages: List[Dict]
+    status: TaskStatus
+    last_error: str
+
+# Define tools
+class ResearchTool:
+    def search(self, query: str) -> str:
+        """Simulated research tool."""
+        return f"Research results for: {query}"
+
+class AnalysisTool:
+    def analyze(self, data: Dict) -> Dict:
+        """Simulated analysis tool."""
+        return {"analysis_result": f"Analysis of {data}"}
+
+class ActionTool:
+    def execute(self, action: Dict) -> Dict:
+        """Simulated action execution tool."""
+        return {"result": f"Executed action: {action}"}
+
+# Create tool executor
+tools = {
+    "research": ResearchTool().search,
+    "analysis": AnalysisTool().analyze,
+    "action": ActionTool().execute,
+}
+tool_executor = ToolExecutor(tools)
+
+# Define prompt templates
+TASK_PLANNING_PROMPT = """You are a task planning AI assistant.
+Given the current context and task, create a detailed plan.
+
+Current Context:
+{context}
+
+Current Task:
+{task}
+
+Previous Messages:
+{messages}
+
+Create a plan that includes:
+1. Required steps
+2. Dependencies
+3. Estimated effort
+4. Potential risks
+5. Success criteria
+
+Respond in the following JSON format:
+{
+    "steps": [{"step": "step description", "effort": "estimated effort"}],
+    "dependencies": ["dependency1", "dependency2"],
+    "risks": ["risk1", "risk2"],
+    "success_criteria": ["criterion1", "criterion2"]
+}
+"""
+
+DECISION_MAKING_PROMPT = """You are a decision-making AI assistant.
+Evaluate the current situation and make a decision about the next step.
+
+Current Context:
+{context}
+
+Current Task:
+{task}
+
+Task Status:
+{status}
+
+Available Options:
+{options}
+
+Previous Messages:
+{messages}
+
+Make a decision and explain your reasoning in the following JSON format:
+{
+    "decision": "chosen option",
+    "reasoning": "explanation of choice",
+    "confidence": 0.0 to 1.0,
+    "next_steps": ["step1", "step2"]
+}
+"""
+
+# Define workflow nodes
+def create_plan(state: WorkflowState) -> Dict:
+    """Create a plan for the current task."""
+    prompt = ChatPromptTemplate.from_template(TASK_PLANNING_PROMPT)
+    llm = ChatOpenAI(temperature=0, model="gpt-4")
+    parser = JsonOutputParser()
+    
+    chain = prompt | llm | parser
+    
+    response = chain.invoke({
+        "context": state["context"],
+        "task": state["current_task"],
+        "messages": state["messages"]
+    })
+    
+    return {"plan": response}
+
+def make_decision(state: WorkflowState) -> Dict:
+    """Make a decision about the next step."""
+    prompt = ChatPromptTemplate.from_template(DECISION_MAKING_PROMPT)
+    llm = ChatOpenAI(temperature=0.2, model="gpt-4")
+    parser = JsonOutputParser()
+    
+    chain = prompt | llm | parser
+    
+    response = chain.invoke({
+        "context": state["context"],
+        "task": state["current_task"],
+        "status": state["status"],
+        "options": list(tools.keys()),
+        "messages": state["messages"]
+    })
+    
+    return {"decision": response}
+
+def execute_task(state: WorkflowState, decision: Dict) -> Dict:
+    """Execute the decided action using appropriate tool."""
+    try:
+        tool_name = decision["decision"]
+        if tool_name not in tools:
+            raise ValueError(f"Unknown tool: {tool_name}")
+            
+        result = tool_executor.execute(
+            tool_name,
+            {
+                "task": state["current_task"],
+                "context": state["context"]
+            }
+        )
+        
+        return {"result": result, "status": TaskStatus.COMPLETED}
+        
+    except Exception as e:
+        logger.error(f"Task execution error: {str(e)}")
+        return {"result": None, "status": TaskStatus.FAILED, "error": str(e)}
+
+def review_results(state: WorkflowState, results: Dict) -> Dict:
+    """Review task results and determine next steps."""
+    if results["status"] == TaskStatus.FAILED:
+        return {
+            "status": TaskStatus.FAILED,
+            "error": results["error"]
+        }
+    
+    # Add completed task to history
+    completed_task = {
+        **state["current_task"],
+        "completion_time": datetime.now().isoformat(),
+        "results": results["result"]
+    }
+    
+    return {
+        "status": TaskStatus.COMPLETED,
+        "completed_task": completed_task
+    }
+
+# Define state updates
+def update_on_plan(state: WorkflowState, plan: Dict) -> WorkflowState:
+    """Update state with new plan."""
+    state["current_task"]["plan"] = plan["plan"]
+    state["status"] = TaskStatus.EXECUTING
+    return state
+
+def update_on_decision(state: WorkflowState, decision: Dict) -> WorkflowState:
+    """Update state with decision."""
+    state["current_task"]["decision"] = decision["decision"]
+    return state
+
+def update_on_review(state: WorkflowState, review: Dict) -> WorkflowState:
+    """Update state based on review results."""
+    if review["status"] == TaskStatus.FAILED:
+        state["status"] = TaskStatus.FAILED
+        state["last_error"] = review["error"]
+    else:
+        state["completed_tasks"].append(review["completed_task"])
+        state["status"] = TaskStatus.COMPLETED
+        
+        # Get next task from queue if available
+        if state["task_queue"]:
+            state["current_task"] = state["task_queue"].pop(0)
+            state["status"] = TaskStatus.PLANNING
+        
+    return state
+
+# Create the workflow graph
+def create_workflow() -> Graph:
+    """Create the workflow graph."""
+    workflow = Graph()
+    
+    # Add nodes
+    workflow.add_node("create_plan", create_plan)
+    workflow.add_node("make_decision", make_decision)
+    workflow.add_node("execute_task", execute_task)
+    workflow.add_node("review_results", review_results)
+    
+    # Add edges
+    workflow.add_edge("create_plan", "make_decision")
+    workflow.add_edge("make_decision", "execute_task")
+    workflow.add_edge("execute_task", "review_results")
+    
+    # Add conditional edges
+    workflow.add_conditional_edges(
+        "review_results",
+        lambda x: "create_plan" if x["status"] == TaskStatus.PLANNING else END
+    )
+    
+    return workflow.compile()
+
+# Main execution class
+class DecisionWorkflow:
+    def __init__(self):
+        self.workflow = create_workflow()
+        
+    def process_task(self, task: Dict, context: Dict) -> Dict:
+        """Process a single task through the workflow."""
+        initial_state: WorkflowState = {
+            "task_queue": [],
+            "current_task": task,
+            "completed_tasks": [],
+            "context": context,
+            "messages": [],
+            "status": TaskStatus.PLANNING,
+            "last_error": ""
+        }
+        
+        try:
+            for event in self.workflow.stream(initial_state):
+                logger.info(f"Step: {event.data}")
+                
+            final_state = event.data
+            
+            return {
+                "status": final_state["status"],
+                "completed_tasks": final_state["completed_tasks"],
+                "error": final_state["last_error"] if final_state["status"] == TaskStatus.FAILED else None
+            }
+            
+        except Exception as e:
+            logger.error(f"Workflow error: {str(e)}")
+            return {
+                "status": TaskStatus.FAILED,
+                "completed_tasks": [],
+                "error": str(e)
+            }
+
+# Example usage
+if __name__ == "__main__":
+    # Create workflow instance
+    workflow = DecisionWorkflow()
+    
+    # Example task
+    task = {
+        "id": "TASK-001",
+        "type": TaskType.ANALYSIS,
+        "priority": TaskPriority.HIGH,
+        "description": "Analyze market trends for Q1 2024",
+        "deadline": "2024-01-31"
+    }
+    
+    # Example context
+    context = {
+        "domain": "finance",
+        "requirements": ["market_data", "competitor_analysis"],
+        "constraints": ["time_sensitive", "high_accuracy"]
+    }
+    
+    # Process task
+    result = workflow.process_task(task, context)
+    
+    print(f"Task Status: {result['status']}")
+    if result['status'] == TaskStatus.COMPLETED:
+        print("\nCompleted Tasks:")
+        for task in result['completed_tasks']:
+            print(f"- {task['description']}: {task['results']}")
+    else:
+        print(f"Error: {result['error']}")
