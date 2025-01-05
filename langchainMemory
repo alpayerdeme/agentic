@@ -1,0 +1,23 @@
+from langchain import OpenAI, ConversationChain
+from langchain.memory import ConversationBufferMemory
+
+# Initialize the OpenAI LLM
+llm = OpenAI(model="text-davinci-003", temperature=0.7)
+
+# Initialize Conversation Memory
+memory = ConversationBufferMemory()
+
+# Create a ConversationChain with memory
+conversation = ConversationChain(llm=llm, memory=memory)
+
+# Simulate a conversation
+print("Chatbot: Hello! How can I assist you today?")
+
+while True:
+    user_input = input("You: ")
+    if user_input.lower() in ["exit", "quit"]:
+        print("Chatbot: Goodbye!")
+        break
+
+    response = conversation.predict(input=user_input)
+    print(f"Chatbot: {response}")
