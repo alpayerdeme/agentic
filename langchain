@@ -1,0 +1,194 @@
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chat_models import ChatOpenAI
+from langchain.chains import ConversationalRetrievalChain
+from langchain.document_loaders import TextLoader
+from langchain.tools import DuckDuckGoSearchRun
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import PromptTemplate
+from typing import List, Dict, Optional
+import os
+from dotenv import load_dotenv
+import logging
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class LLMSearchSystem:
+    def __init__(self, openai_api_key: str):
+        """Initialize the search system with necessary components."""
+        self.openai_api_key = openai_api_key
+        self.embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+        self.llm = ChatOpenAI(
+            temperature=0.7,
+            model_name="gpt-3.5-turbo-16k",
+            openai_api_key=openai_api_key
+        )
+        self.search = DuckDuckGoSearchRun()
+        self.memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True
+        )
+        
+        # Initialize vector store
+        self.vector_store = self._initialize_vector_store()
+        
+    def _initialize_vector_store(self) -> Chroma:
+        """Initialize and populate vector store with LLM concept documents."""
+        # Load and process documents about LLM concepts
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len
+        )
+        
+        # Example document about LLM concepts
+        llm_concepts = """
+        Large Language Models (LLMs) are advanced AI systems trained on vast amounts of text data.
+        Key concepts include:
+        1. Transformer Architecture: The backbone of modern LLMs
+        2. Attention Mechanism: Allows models to focus on relevant parts of input
+        3. Transfer Learning: Pre-training and fine-tuning approach
+        4. Prompt Engineering: Crafting effective inputs for desired outputs
+        5. Few-shot Learning: Learning from minimal examples
+        6. Zero-shot Learning: Performing tasks without specific training
+        7. Chain-of-Thought: Breaking down complex reasoning
+        """
+        
+        documents = text_splitter.create_documents([llm_concepts])
+        
+        # Create vector store
+        vector_store = Chroma.from_documents(
+            documents=documents,
+            embedding=self.embeddings,
+            collection_name="llm_concepts"
+        )
+        
+        return vector_store
+    
+    def _create_rag_chain(self) -> ConversationalRetrievalChain:
+        """Create the RAG chain with custom prompts."""
+        custom_template = """You are an AI expert specializing in Large Language Models.
+        Use the following pieces of context to answer the question at the end.
+        If you don't find the answer in the context, say "I need to search external sources."
+        
+        Context: {context}
+        
+        Chat History: {chat_history}
+        
+        Question: {question}
+        
+        Answer: """
+        
+        CUSTOM_PROMPT = PromptTemplate(
+            input_variables=["context", "chat_history", "question"],
+            template=custom_template
+        )
+        
+        return ConversationalRetrievalChain.from_llm(
+            llm=self.llm,
+            retriever=self.vector_store.as_retriever(
+                search_kwargs={"k": 3}
+            ),
+            memory=self.memory,
+            combine_docs_chain_kwargs={"prompt": CUSTOM_PROMPT}
+        )
+    
+    def _search_web(self, query: str) -> str:
+        """Perform web search and format results."""
+        try:
+            search_results = self.search.run(f"LLM concepts {query}")
+            
+            # Create a prompt to summarize search results
+            summary_prompt = f"""Summarize the following information about LLM concepts:
+            {search_results}
+            
+            Focus on providing a clear, accurate answer to: {query}
+            """
+            
+            # Get LLM to summarize the search results
+            summary = self.llm.predict(summary_prompt)
+            return summary
+        
+        except Exception as e:
+            logger.error(f"Web search error: {str(e)}")
+            return "I encountered an error while searching external sources."
+    
+    def search_and_respond(self, query: str) -> Dict[str, str]:
+        """Main method to search and respond to queries."""
+        try:
+            # First, try RAG
+            rag_chain = self._create_rag_chain()
+            result = rag_chain({"question": query})
+            
+            # Check if RAG provided a sufficient answer
+            if "I need to search external sources" in result["answer"]:
+                logger.info("RAG insufficient, falling back to web search")
+                web_result = self._search_web(query)
+                return {
+                    "source": "web",
+                    "answer": web_result,
+                    "query": query
+                }
+            
+            return {
+                "source": "rag",
+                "answer": result["answer"],
+                "query": query
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in search_and_respond: {str(e)}")
+            return {
+                "source": "error",
+                "answer": "I encountered an error processing your query.",
+                "query": query
+            }
+    
+    def add_to_knowledge_base(self, new_content: str):
+        """Add new content to the vector store."""
+        try:
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200,
+                length_function=len
+            )
+            
+            new_documents = text_splitter.create_documents([new_content])
+            self.vector_store.add_documents(new_documents)
+            logger.info("Successfully added new content to knowledge base")
+            
+        except Exception as e:
+            logger.error(f"Error adding to knowledge base: {str(e)}")
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize the search system
+    search_system = LLMSearchSystem(openai_api_key=os.getenv("OPENAI_API_KEY"))
+    
+    # Example queries
+    example_queries = [
+        "What is the transformer architecture in LLMs?",
+        "How does few-shot learning work in language models?",
+        "What are the latest developments in LLM training techniques?",
+    ]
+    
+    # Test the system
+    for query in example_queries:
+        print(f"\nQuery: {query}")
+        result = search_system.search_and_respond(query)
+        print(f"Source: {result['source']}")
+        print(f"Answer: {result['answer']}")
+        
+    # Example of adding new knowledge
+    new_content = """
+    Mixture of Experts (MoE) is an advanced LLM architecture where multiple specialized
+    sub-models (experts) handle different types of tasks. This approach improves
+    efficiency and performance while reducing computational resources.
+    """
+    search_system.add_to_knowledge_base(new_content)
