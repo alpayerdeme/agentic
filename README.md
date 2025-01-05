@@ -1036,3 +1036,19 @@ The system will:
 4. Review results and determine next steps
 5. Handle any errors or failures gracefully
 
+*******************************************************************
+
+crawler = WebCrawlerChain(openai_api_key="your-key")
+
+# Crawl a single page
+results = crawler.crawl_page("https://example.com")
+
+# Get analysis
+analysis = crawler.analyze_results(results)
+
+# Print findings
+print(analysis["summary"])
+print(analysis["analysis"])
+
+
+*****************************************************************  
