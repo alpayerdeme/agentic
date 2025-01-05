@@ -1,0 +1,291 @@
+from typing import List, Dict, Optional, Union
+from pathlib import Path
+import logging
+import json
+from datetime import datetime
+import os
+from dataclasses import dataclass
+
+from langchain.document_loaders import (
+    PyPDFLoader,
+    CSVLoader,
+    UnstructuredExcelLoader,
+    UnstructuredWordDocumentLoader
+)
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.chat_models import ChatOpenAI
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import PromptTemplate
+from langchain.callbacks import get_openai_callback
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import LLMChainExtractor
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class DocumentMetadata:
+    """Metadata for financial documents."""
+    doc_type: str  # e.g., "policy", "report", "client_document"
+    department: str  # e.g., "compliance", "trading", "risk"
+    created_date: str
+    last_modified: str
+    classification: str  # e.g., "confidential", "internal", "public"
+    document_id: str
+
+class DocumentProcessor:
+    """Handles loading and processing of different document types."""
+    
+    def __init__(self):
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len,
+            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]
+        )
+    
+    def load_document(self, file_path: str, metadata: DocumentMetadata) -> List[dict]:
+        """Load document based on file type and add metadata."""
+        file_extension = Path(file_path).suffix.lower()
+        
+        try:
+            if file_extension == '.pdf':
+                loader = PyPDFLoader(file_path)
+            elif file_extension == '.csv':
+                loader = CSVLoader(file_path)
+            elif file_extension in ['.xlsx', '.xls']:
+                loader = UnstructuredExcelLoader(file_path)
+            elif file_extension in ['.doc', '.docx']:
+                loader = UnstructuredWordDocumentLoader(file_path)
+            else:
+                raise ValueError(f"Unsupported file type: {file_extension}")
+
+            documents = loader.load()
+            
+            # Add metadata to each document chunk
+            for doc in documents:
+                doc.metadata.update({
+                    "doc_type": metadata.doc_type,
+                    "department": metadata.department,
+                    "created_date": metadata.created_date,
+                    "last_modified": metadata.last_modified,
+                    "classification": metadata.classification,
+                    "document_id": metadata.document_id,
+                    "source_file": file_path
+                })
+            
+            # Split documents into chunks
+            split_docs = self.text_splitter.split_documents(documents)
+            
+            logger.info(f"Processed {file_path}: {len(split_docs)} chunks created")
+            return split_docs
+            
+        except Exception as e:
+            logger.error(f"Error processing {file_path}: {str(e)}")
+            raise
+
+class FinanceRAGSystem:
+    """Main RAG system for financial documents."""
+    
+    def __init__(self, openai_api_key: str, persist_directory: str):
+        self.openai_api_key = openai_api_key
+        self.persist_directory = persist_directory
+        
+        # Initialize components
+        self.embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+        self.llm = ChatOpenAI(
+            temperature=0,
+            model_name="gpt-4",
+            openai_api_key=openai_api_key
+        )
+        
+        # Initialize document processor
+        self.doc_processor = DocumentProcessor()
+        
+        # Initialize vector store
+        self.vector_store = self._initialize_vector_store()
+        
+        # Initialize memory
+        self.memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True
+        )
+        
+        # Initialize retrieval chain
+        self.retrieval_chain = self._create_retrieval_chain()
+        
+        # Track usage
+        self.usage_log = []
+
+    def _initialize_vector_store(self) -> Chroma:
+        """Initialize or load existing vector store."""
+        return Chroma(
+            persist_directory=self.persist_directory,
+            embedding_function=self.embeddings
+        )
+    
+    def _create_retrieval_chain(self) -> ConversationalRetrievalChain:
+        """Create retrieval chain with custom prompts."""
+        custom_template = """You are a financial expert assistant for a finance company.
+        Use only the following context to answer the question. If you're unsure or the information
+        is not in the context, say "I don't have enough information to answer this question accurately."
+        
+        Be especially careful with:
+        - Numerical values and calculations
+        - Dates and deadlines
+        - Policy requirements and restrictions
+        - Client-specific information
+        
+        Always mention if the information comes from a specific policy or document.
+        
+        Context: {context}
+        
+        Chat History: {chat_history}
+        
+        Question: {question}
+        
+        Answer: """
+        
+        CUSTOM_PROMPT = PromptTemplate(
+            input_variables=["context", "chat_history", "question"],
+            template=custom_template
+        )
+        
+        # Create a context compressor for more relevant retrieval
+        compressor = LLMChainExtractor.from_llm(self.llm)
+        compressed_retriever = ContextualCompressionRetriever(
+            base_retriever=self.vector_store.as_retriever(search_kwargs={"k": 4}),
+            doc_compressor=compressor
+        )
+        
+        return ConversationalRetrievalChain.from_llm(
+            llm=self.llm,
+            retriever=compressed_retriever,
+            memory=self.memory,
+            combine_docs_chain_kwargs={"prompt": CUSTOM_PROMPT},
+            return_source_documents=True
+        )
+
+    def add_documents(self, file_paths: List[str], metadata_list: List[DocumentMetadata]):
+        """Add new documents to the vector store."""
+        if len(file_paths) != len(metadata_list):
+            raise ValueError("Number of file paths must match number of metadata entries")
+        
+        all_documents = []
+        for file_path, metadata in zip(file_paths, metadata_list):
+            try:
+                documents = self.doc_processor.load_document(file_path, metadata)
+                all_documents.extend(documents)
+            except Exception as e:
+                logger.error(f"Error processing {file_path}: {str(e)}")
+                continue
+        
+        if all_documents:
+            self.vector_store.add_documents(all_documents)
+            self.vector_store.persist()
+            logger.info(f"Added {len(all_documents)} documents to vector store")
+
+    def query(self, question: str) -> Dict[str, Union[str, List[dict]]]:
+        """Process a query and return answer with sources."""
+        try:
+            with get_openai_callback() as cb:
+                result = self.retrieval_chain({"question": question})
+                
+                # Log usage
+                usage_entry = {
+                    "timestamp": datetime.now().isoformat(),
+                    "query": question,
+                    "total_tokens": cb.total_tokens,
+                    "total_cost": cb.total_cost,
+                    "source_documents": [
+                        {
+                            "doc_id": doc.metadata["document_id"],
+                            "doc_type": doc.metadata["doc_type"],
+                            "department": doc.metadata["department"],
+                            "classification": doc.metadata["classification"]
+                        }
+                        for doc in result["source_documents"]
+                    ]
+                }
+                self.usage_log.append(usage_entry)
+                
+                return {
+                    "answer": result["answer"],
+                    "sources": [
+                        {
+                            "document_id": doc.metadata["document_id"],
+                            "doc_type": doc.metadata["doc_type"],
+                            "department": doc.metadata["department"],
+                            "source_file": doc.metadata["source_file"],
+                            "classification": doc.metadata["classification"],
+                            "content": doc.page_content[:200] + "..."  # Preview of content
+                        }
+                        for doc in result["source_documents"]
+                    ]
+                }
+                
+        except Exception as e:
+            logger.error(f"Error processing query: {str(e)}")
+            return {
+                "answer": "An error occurred while processing your query.",
+                "sources": []
+            }
+
+    def export_usage_logs(self, output_file: str):
+        """Export usage logs to JSON file."""
+        try:
+            with open(output_file, 'w') as f:
+                json.dump(self.usage_log, f, indent=2)
+            logger.info(f"Usage logs exported to {output_file}")
+        except Exception as e:
+            logger.error(f"Error exporting usage logs: {str(e)}")
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize the system
+    rag_system = FinanceRAGSystem(
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        persist_directory="./finance_docs_store"
+    )
+    
+    # Example document metadata
+    example_metadata = DocumentMetadata(
+        doc_type="policy",
+        department="compliance",
+        created_date="2024-01-01",
+        last_modified="2024-01-05",
+        classification="internal",
+        document_id="POL-2024-001"
+    )
+    
+    # Add documents
+    rag_system.add_documents(
+        file_paths=["./docs/trading_policy.pdf"],
+        metadata_list=[example_metadata]
+    )
+    
+    # Example queries
+    queries = [
+        "What are the trading restrictions for employee accounts?",
+        "What is the process for reporting suspicious transactions?",
+        "What are the document retention requirements for client records?"
+    ]
+    
+    # Test the system
+    for query in queries:
+        print(f"\nQuery: {query}")
+        result = rag_system.query(query)
+        print(f"Answer: {result['answer']}")
+        print("\nSources:")
+        for source in result['sources']:
+            print(f"- {source['doc_type']} from {source['department']}")
+    
+    # Export usage logs
+    rag_system.export_usage_logs("rag_usage_logs.json")
